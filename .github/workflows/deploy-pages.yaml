@@ -1,0 +1,238 @@
+name: Deploy Gallery to GitHub Pages
+
+# 这个仓库不放源码：站点内容全部由 CeSun/Aura3D 的浏览器宿主构建产出，产物只活在 Pages 的
+# artifact 里——一次 wwwroot 实测 108MB（_framework 84 + assets 24），提交进 git 历史几次就是几百 MB，
+# 所以这里连一版构建结果都不留。
+#
+# 一条产物一条通道。质量门禁（四个宿主构建、资产预算、CJK 覆盖、核心测试）全在 Aura3D 的
+# CI 里，能进 main 的就是能上线的，这个 workflow 不复述任何检查，只负责构建 + 部署。
+#
+# 三种触发：
+#   schedule            每 6 小时看一次 Aura3D 的 main，比线上那版新才构建（见 check 作业）。
+#   workflow_dispatch   随时手动，可指定要构建的 ref。
+#   repository_dispatch 留给「合并瞬间上线」：需要 Aura3D 侧先配一个能写本仓库的跨仓库凭据，
+#                       凭据没配之前这条通道不会被触发，留着不报错。
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Aura3D 仓库要构建的 ref（分支名，或完整的 40 位提交号）
+        type: string
+        default: main
+  repository_dispatch:
+    types: [deploy-gallery]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-pages
+  # 部署中途不能被撤：被取消会留下半套 _framework 清单，线上就是 CoreLib 与 icall 不同步的启动崩溃。
+  cancel-in-progress: false
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  SOURCE_REPO: CeSun/Aura3D
+  # 结尾的斜杠是必须的：main.js 用相对路径取 ./_framework/dotnet.js，资产根也从页面 URL 推导
+  SITE_URL: https://cesun.github.io/Aura3D-Gallery/
+
+jobs:
+  check:
+    name: 线上是否已是最新
+    runs-on: ubuntu-latest
+    outputs:
+      needed: ${{ steps.decide.outputs.needed }}
+      sha: ${{ steps.remote.outputs.sha }}
+    steps:
+      - name: 解析要构建的提交
+        id: remote
+        env:
+          # 触发输入走 env 而不是直接插进 shell：手滑打个引号也不会变成脚本注入
+          REF: ${{ inputs.source_ref }}
+          PAYLOAD_REF: ${{ github.event.client_payload.ref }}
+        run: |
+          set -euo pipefail
+          ref="${REF:-${PAYLOAD_REF:-main}}"
+          sha=$(git ls-remote "https://github.com/${SOURCE_REPO}" "refs/heads/${ref}" | head -1 | cut -f1)
+          if [ -z "$sha" ]; then
+            # 不是分支名，那就只能是提交号；ls-remote 拿不到短提交号，所以这里要求完整 40 位
+            case "$ref" in
+              *[!0-9a-f]*)
+                echo "::error::${ref} 既不是 ${SOURCE_REPO} 的分支，也不是完整提交号" >&2
+                exit 1
+                ;;
+              *) sha="$ref" ;;
+            esac
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: 与线上记录的来源提交比对
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          SHA: ${{ steps.remote.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # 只有定时任务会跳过；手动与 dispatch 一律真构建，方便随时把同一版重发一次。
+          if [ "$EVENT" != 'schedule' ]; then
+            echo 'needed=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          live=$(curl -sf "${SITE_URL}source-sha.txt" || true)
+          if [ "$live" = "$SHA" ]; then
+            echo "线上已是 $live，跳过构建" >> "$GITHUB_STEP_SUMMARY"
+            echo 'needed=false' >> "$GITHUB_OUTPUT"
+          else
+            echo "线上 ${live:-（还没部署过）} → $SHA" >> "$GITHUB_STEP_SUMMARY"
+            echo 'needed=true' >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Publish browser host
+    needs: check
+    if: needs.check.outputs.needed == 'true'
+    runs-on: macos-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    outputs:
+      # 部署后要拿它验 MIME：native wasm 的文件名带构建哈希，只有构建时才知道具体是哪一个
+      native_wasm: ${{ steps.site.outputs.native_wasm }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 跨仓库读的是公开仓库，不传 token；persist-credentials 关掉，构建脚本拿不到任何凭据
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.check.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Install workloads
+        # 必须 macOS：Aura3D.Gallery.Browser 的引用图里有 Aura3D.Avalonia 的 net10.0-ios 目标，
+        # restore 就要 ios workload，而它在 Linux runner 上装不了（与 Aura3D ci.yml 同一个结论）。
+        # wasm-tools 顺带带来 emsdk（.NET 10 里它是 microsoft-net-sdk-emscripten 抽象 workload，
+        # 没有独立 ID）。浏览器宿主必须原生链接：GLES 入口点要从应用自己的 wasm 模块里取，
+        # 少了它就会在启动时抛 libSkiaSharp 的 DllNotFoundException。
+        run: dotnet workload install wasm-tools ios
+
+      - name: Publish
+        # 每次都是全新 runner，obj/bin 与发布目录天然从零开始，比 --no-incremental 更硬
+        # （SDK 10.0.300 的 dotnet publish 也没有这个开关，写了会被转发给 MSBuild 报 MSB1001）。
+        run: |
+          dotnet publish -c Release \
+            -p:UseArtifactsOutput=true \
+            -p:ArtifactsPath="$PWD/artifacts/gallery-deploy" \
+            gallery/Aura3D.Gallery.Browser/Aura3D.Gallery.Browser.csproj
+
+      - name: 校验产物并烙上来源提交
+        id: site
+        env:
+          SHA: ${{ needs.check.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # 路径由 SDK 的 ArtifactsPath 布局决定，所以按模式找而不是写死一层目录
+          w=$(find "$PWD/artifacts/gallery-deploy" -type d -path '*/publish/Aura3D.Gallery.Browser/*/wwwroot' | head -1)
+          if [ -z "$w" ]; then
+            echo '::error::找不到发布产物 wwwroot，发布目录布局变了' >&2
+            exit 1
+          fi
+          for f in index.html main.js _framework/dotnet.js assets/manifest.json; do
+            if [ ! -f "$w/$f" ]; then
+              echo "::error::产物不完整，缺 $f（在 $w）" >&2
+              exit 1
+            fi
+          done
+          over=$(find "$w" -type f -size +100M -print -quit)
+          if [ -n "$over" ]; then
+            echo "::error::单文件超过 GitHub Pages 的 100MB 硬限：$over" >&2
+            exit 1
+          fi
+          # 线上跑的是哪个提交必须可查——check 作业就是拿这个文件决定要不要重发
+          echo "$SHA" > "$w/source-sha.txt"
+          # native wasm 只可能有一个（.gz/.br 变体不以 .wasm 结尾，glob 天然排掉），多个就是布局变了
+          native=$(cd "$w/_framework" && ls -1 dotnet.native.*.wasm || true)
+          if [ "$(printf '%s\n' "$native" | grep -c .)" != 1 ]; then
+            echo "::error::dotnet.native.*.wasm 数量不是 1，而是：$(printf '%s ' $native)" >&2
+            exit 1
+          fi
+          echo "wwwroot=$w" >> "$GITHUB_OUTPUT"
+          echo "native_wasm=$native" >> "$GITHUB_OUTPUT"
+          {
+            echo '### 站点产物'
+            echo
+            echo '| 项 | 值 |'
+            echo '| --- | --- |'
+            echo "| 来源提交 | $SHA |"
+            echo "| 提交说明 | $(git log -1 --pretty=%s) |"
+            echo "| wwwroot 合计 | $(du -sh "$w" | cut -f1) |"
+            echo "| _framework | $(du -sh "$w/_framework" | cut -f1) |"
+            echo "| assets | $(du -sh "$w/assets" | cut -f1) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/configure-pages@v4
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ steps.site.outputs.wwwroot }}
+
+  deploy:
+    name: Deploy to Pages
+    needs: [check, build]
+    if: needs.check.outputs.needed == 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      # 作业级 permissions 是整块覆盖顶层的，所以 contents: read 要在这里再写一遍
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: 冒烟检查线上资源
+        env:
+          SHA: ${{ needs.check.outputs.sha }}
+          NATIVE: ${{ needs.build.outputs.native_wasm }}
+        run: |
+          set -euo pipefail
+          # Pages 传播有几十秒延迟，所以重试而不是单次判定
+          for try in 1 2 3 4 5 6; do
+            live=$(curl -sf "${SITE_URL}source-sha.txt" || true)
+            [ "$live" = "$SHA" ] && break
+            echo "第 $try 次：线上是 ${live:-无}，20s 后重试"
+            sleep 20
+          done
+          if [ "$live" != "$SHA" ]; then
+            echo "::error::部署完成但线上 source-sha.txt 仍是 ${live:-无}，期望 $SHA" >&2
+            exit 1
+          fi
+          curl -sf "${SITE_URL}index.html" -o /dev/null
+          curl -sf "${SITE_URL}main.js" -o /dev/null
+          curl -sf "${SITE_URL}_framework/dotnet.js" -o /dev/null
+          # wasm 的 MIME 必须是 application/wasm，否则浏览器不当模块加载，
+          # 而报出来的错完全看不出是这个原因
+          mime=$(curl -sIL "${SITE_URL}_framework/${NATIVE}" | tr -d '\r' \
+            | awk 'tolower($0) ~ /^content-type:/ {v=$2} END {print v}')
+          if [ "$mime" != 'application/wasm' ]; then
+            echo "::error::${NATIVE} 的 content-type 是 ${mime:-取不到}，不是 application/wasm" >&2
+            exit 1
+          fi
+          {
+            echo '### 线上冒烟检查'
+            echo
+            echo "- 来源提交：\`$SHA\`"
+            echo "- 首页 / main.js / dotnet.js 均可取"
+            echo "- \`$NATIVE\`：${mime}"
+          } >> "$GITHUB_STEP_SUMMARY"
